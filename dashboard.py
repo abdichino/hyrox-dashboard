@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from supabase import create_client, Client
-from datetime import date
+from datetime import date, timedelta
 
 st.set_page_config(page_title="Hyrox Tracker", layout="wide", page_icon="💀")
 
@@ -194,6 +194,31 @@ with st.sidebar.form("data_entry_form", clear_on_submit=True):
             st.error("Please enter a name for the new athlete.")
         else:
             try:
+
+                is_pb = False
+                recovery_status = "Incomplete Data"
+                
+                if not df.empty:
+                    athlete_history = df[(df['Athlete'] == new_athlete_name) & (df['Station'] == new_station)]
+                    
+                    if not athlete_history.empty:
+                        previous_best = athlete_history['Time (min)'].min()
+                        if float(new_time) < previous_best:
+                            is_pb = True
+                        
+                        # Recovery Score: (Time * RPE) 
+                        # Lower score = Better efficiency (Lower time for lower effort)
+                        current_efficiency = float(new_time) * int(new_rpe)
+                        avg_efficiency = (athlete_history['Time (min)'] * athlete_history['RPE']).mean()
+                        
+                        if current_efficiency < (avg_efficiency * 0.95):
+                            recovery_status = "High Recovery (Highly Efficient)"
+                        elif current_efficiency > (avg_efficiency * 1.10):
+                            recovery_status = "High Fatigue (Low Efficiency)"
+                        else:
+                            recovery_status = "Normal / Baseline"
+
+
                 supabase.table("hyrox_results").insert({
                     "athlete_name": new_athlete_name, 
                     "station": new_station,
@@ -202,10 +227,19 @@ with st.sidebar.form("data_entry_form", clear_on_submit=True):
                     "duration_minutes": float(new_duration), 
                     "rpe": int(new_rpe)
                 }).execute()
-                st.success(f"Logged {new_athlete_name} successfully.")
-                # Clear cache so the new name appears in the list immediately
+
+                if is_pb:
+                    st.balloons()
+                    st.success(f"NEW PB! {new_athlete_name} crushed the {new_station}!")
+                else:
+                    st.success(f"Logged {new_athlete_name} successfully.")
+                
+                st.info(f"Recovery Check: {recovery_status}")
+
+                # 4. REFRESH
                 st.cache_data.clear()
                 st.rerun()
+
             except Exception as e:
                 st.error(f"Database error: {e}")
 
@@ -286,3 +320,83 @@ if st.sidebar.button("Delete Last Entry for Athlete"):
             st.sidebar.error(f"Deletion failed: {e}")
     else:
         st.sidebar.info("Select an existing athlete to delete their last entry.")
+
+st.markdown("---")
+st.header("30-Day Performance Audit")
+
+if not df.empty:
+    thirty_days_ago = pd.to_datetime(date.today() - timedelta(days=30))
+    recent_df = df[df['Date'] >= thirty_days_ago]
+    
+    if not recent_df.empty:
+        summary_data = []
+        for athlete in recent_df['Athlete'].unique():
+            a_df = recent_df[recent_df['Athlete'] == athlete]
+            
+            # Calculate metrics
+            avg_strain = a_df['Session_Load'].mean() # Simplified strain for the month
+            total_minutes = a_df['Duration'].sum()
+            sessions = len(a_df)
+            
+            summary_data.append({
+                "Athlete": athlete,
+                "Sessions": sessions,
+                "Total Mat Time (min)": total_minutes,
+                "Avg Session Intensity": round(avg_strain, 1)
+            })
+        
+        audit_df = pd.DataFrame(summary_data).sort_values("Avg Session Intensity", ascending=False)
+        st.dataframe(audit_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No data recorded in the last 30 days.")
+else:
+    st.info("Database is empty.")
+
+# Weekly monitor
+st.markdown("---")
+st.header("Weekly Fatigue Monitor")
+
+if not df.empty:
+    seven_days_ago = pd.to_datetime(date.today() - timedelta(days=7))
+    week_df = df[df['Date'] >= seven_days_ago].copy()
+    
+    if not week_df.empty:
+        fatigue_alerts = []
+        for athlete in week_df['Athlete'].unique():
+            # Get current week data
+            a_week = week_df[week_df['Athlete'] == athlete]
+            # Get all-time history for baseline
+            a_history = df[df['Athlete'] == athlete]
+            
+            if len(a_history) > 3: # Need at least a small baseline
+                curr_eff = (a_week['Time (min)'] * a_week['RPE']).mean()
+                hist_eff = (a_history['Time (min)'] * a_history['RPE']).mean()
+                
+                # Efficiency Ratio: Current / Historical
+                # > 1.10 means they are 10% less efficient than usual
+                ratio = curr_eff / hist_eff
+                
+                status = "Recovered"
+                if ratio > 1.15: status = "HIGH FATIGUE"
+                elif ratio > 1.05: status = "Mild Strain"
+                
+                fatigue_alerts.append({
+                    "Athlete": athlete,
+                    "Efficiency Ratio": round(ratio, 2),
+                    "Status": status,
+                    "Recent Avg RPE": round(a_week['RPE'].mean(), 1)
+                })
+        
+        if fatigue_alerts:
+            alert_df = pd.DataFrame(fatigue_alerts).sort_values("Efficiency Ratio", ascending=False)
+            
+            # Highlight the red flags
+            st.dataframe(alert_df.style.applymap(
+                lambda x: 'background-color: #ff4b4b; color: white' if x == "HIGH FATIGUE" else 
+                          ('background-color: #ffa500; color: black' if x == "Mild Strain" else ''),
+                subset=['Status']
+            ), use_container_width=True, hide_index=True)
+        else:
+            st.info("Gathering more baseline data...")
+    else:
+        st.info("No sessions logged in the last 7 days.")
