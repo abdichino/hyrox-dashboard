@@ -168,27 +168,96 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("Log New Session")
 
+# Get existing athletes for the dropdown
+existing_athletes = sorted(df['Athlete'].unique().tolist()) if not df.empty else []
+existing_athletes = ["+ Add New Athlete"] + existing_athletes
+
 with st.sidebar.form("data_entry_form", clear_on_submit=True):
-    new_athlete = st.text_input("Athlete Name")
+    # Selection logic
+    athlete_choice = st.selectbox("Select Athlete", existing_athletes)
+    
+    if athlete_choice == "+ Add New Athlete":
+        new_athlete_name = st.text_input("New Athlete Name").strip().title()
+    else:
+        new_athlete_name = athlete_choice
+
     new_station = st.selectbox("Focus Station", ['1km Run', 'SkiErg', 'Sled Push', 'Sled Pull', 'Burpee Broad Jumps', 'Rowing', 'Farmers Carry', 'Sandbag Lunges', 'Wall Balls', 'Full Race'])
     new_time = st.number_input("Time on Station (mins)", min_value=0.0, value=5.0, step=0.1)
     
     st.markdown("**Internal Load**")
     new_duration = st.number_input("Total Session Duration (mins)", min_value=1.0, value=60.0)
-    new_rpe = st.slider("Session RPE (1 = Asleep, 10 = Dying)", 1, 10, 7)
+    new_rpe = st.slider("Session RPE (1-10)", 1, 10, 7)
     new_date = st.date_input("Date", date.today())
     
     if st.form_submit_button("Submit Pain"):
-        if not new_athlete.strip():
-            st.error("Enter a name.")
+        if athlete_choice == "+ Add New Athlete" and not new_athlete_name:
+            st.error("Please enter a name for the new athlete.")
         else:
             try:
                 supabase.table("hyrox_results").insert({
-                    "athlete_name": new_athlete, "station": new_station,
-                    "time_minutes": float(new_time), "recorded_at": str(new_date),
-                    "duration_minutes": float(new_duration), "rpe": int(new_rpe)
+                    "athlete_name": new_athlete_name, 
+                    "station": new_station,
+                    "time_minutes": float(new_time), 
+                    "recorded_at": str(new_date),
+                    "duration_minutes": float(new_duration), 
+                    "rpe": int(new_rpe)
                 }).execute()
-                st.success("Logged successfully.")
-                get_real_data.clear()
+                st.success(f"Logged {new_athlete_name} successfully.")
+                # Clear cache so the new name appears in the list immediately
+                st.cache_data.clear()
+                st.rerun()
             except Exception as e:
                 st.error(f"Database error: {e}")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Data Hoarding")
+
+if not df.empty:
+    # Convert the dataframe to a CSV string
+    csv_data = df.to_csv(index=False).encode('utf-8')
+    
+    st.sidebar.download_button(
+        label="Download as CSV",
+        data=csv_data,
+        file_name=f"hyrox_victims_{date.today()}.csv",
+        mime="text/csv",
+    )
+else:
+    st.sidebar.info("No data to export.")
+
+# Leaderboard
+st.markdown("---")
+st.header("Predicted Leaderboard")
+
+if not df.empty:
+    leaderboard_data = []
+    
+    # Calculate the latest Bayesian prediction for every athlete
+    for athlete_name in df['Athlete'].unique():
+        athlete_subset = df[df['Athlete'] == athlete_name].copy()
+        athlete_subset['Projected_Pace'] = athlete_subset.apply(
+            lambda row: station_to_race_pace(row['Station'], row['Time (min)']), axis=1
+        )
+        
+        # Run the Bayesian engine on their history
+        res = bayesian_race_predictor(athlete_subset['Projected_Pace'].tolist())
+        
+        if not res.empty:
+            latest = res.iloc[-1]
+            leaderboard_data.append({
+                "Athlete": athlete_name,
+                "Predicted Time (min)": round(latest['Predicted_Time'], 1),
+                "Confidence Interval (±)": round(latest['Uncertainty_Std'] * 2, 1),
+                "Last Station": athlete_subset['Station'].iloc[-1]
+            })
+
+    # Display as a clean, sorted table
+    leader_df = pd.DataFrame(leaderboard_data).sort_values("Predicted Time (min)")
+    
+    # Add a 'Rank' column
+    leader_df.insert(0, 'Rank', range(1, len(leader_df) + 1))
+    
+    st.table(leader_df.set_index('Rank'))
+    st.caption("Lower is better. If you're at the bottom, the math suggests you try harder.")
+else:
+    st.info("Leaderboard is empty. Waiting for the first victim.")
