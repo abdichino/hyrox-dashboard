@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+from supabase import create_client, Client
 import numpy as np
 import plotly.express as px
 from datetime import timedelta, date
@@ -8,34 +9,32 @@ from datetime import timedelta, date
 # Don't even think about using global variables for state management.
 st.set_page_config(page_title="Hyrox Suffering Tracker", layout="wide", page_icon="💀")
 
-# --- 2. DATA MOCKING (Because your backend doesn't exist) ---
-@st.cache_data
-def get_fake_data():
-    """Generating data because you haven't wired up a PostgreSQL database yet."""
-    np.random.seed(42)
-    dates = pd.date_range(start=date.today() - timedelta(days=90), periods=12, freq='W')
-    
-    # The actual HYROX gauntlet
-    stations = [
-        '1km Run', 'SkiErg', 'Sled Push', 'Sled Pull', 
-        'Burpee Broad Jumps', 'Rowing', 'Farmers Carry', 
-        'Sandbag Lunges', 'Wall Balls'
-    ]
-    
-    data = []
-    for athlete in ['Victim A', 'Victim B', 'Victim C']:
-        base_time = np.random.uniform(60, 90)  # Total minutes baseline
-        for i, d in enumerate(dates):
-            # Assume they get slightly better, or just randomly worse
-            improvement = i * 0.5 + np.random.normal(0, 1)
-            for station in stations:
-                # Random minutes per station (rough approximation for the demo)
-                time_taken = max(2.0, (base_time / 9) - improvement * 0.1 + np.random.normal(0, 0.5))
-                data.append({'Athlete': athlete, 'Date': d, 'Station': station, 'Time (min)': time_taken})
-    
-    return pd.DataFrame(data)
+@st.cache_resource
+def init_connection() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-df = get_fake_data()
+supabase = init_connection()
+
+# --- 2. DATA ---
+@st.cache_data(ttl=600) # Caches data for 10 minutes so you don't burn your free tier API limits
+def get_real_data():
+    # Fetching data like a grown-up
+    response = supabase.table("hyrox_results").select("*").execute()
+    data = response.data
+    
+    if not data:
+        # Fallback if your database is empty so the app doesn't immediately crash
+        return pd.DataFrame(columns=['athlete_name', 'station', 'time_minutes', 'recorded_at'])
+    
+    df = pd.DataFrame(data)
+    # Rename columns to match the rest of the dashboard code you already copied
+    df = df.rename(columns={'athlete_name': 'Athlete', 'station': 'Station', 'time_minutes': 'Time (min)', 'recorded_at': 'Date'})
+    df['Date'] = pd.to_datetime(df['Date'])
+    return df
+
+df = get_real_data()
 
 # --- 3. UI LAYOUT ---
 st.title("🏃‍♂️ Hyrox Class Dashboard")
