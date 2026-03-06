@@ -260,4 +260,29 @@ if not df.empty:
     st.table(leader_df.set_index('Rank'))
     st.caption("Lower is better. If you're at the bottom, the math suggests you try harder.")
 else:
-    st.info("Leaderboard is empty. Waiting for the first victim.")
+    st.info("Leaderboard is empty.")
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Delete Last Entry for Athlete"):
+    if athlete_choice != "+ Add New Athlete":
+        try:
+            # Find the ID of the most recent entry for this specific human
+            last_entry = supabase.table("hyrox_results") \
+                .select("id") \
+                .eq("athlete_name", athlete_choice) \
+                .order("recorded_at", desc=True) \
+                .limit(1) \
+                .execute()
+            
+            if last_entry.data:
+                record_id = last_entry.data[0]['id']
+                supabase.table("hyrox_results").delete().eq("id", record_id).execute()
+                st.sidebar.success(f"Deleted last entry for {athlete_choice}.")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.sidebar.warning("No data found to delete.")
+        except Exception as e:
+            st.sidebar.error(f"Deletion failed: {e}")
+    else:
+        st.sidebar.info("Select an existing athlete to delete their last entry.")
