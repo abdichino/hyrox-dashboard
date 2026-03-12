@@ -4,6 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 from supabase import create_client, Client
 from datetime import date, timedelta
+import urllib.parse
 
 st.set_page_config(page_title="Hyrox Tracker", layout="wide", page_icon="💀")
 
@@ -15,14 +16,24 @@ def init_connection() -> Client:
 supabase = init_connection()
 
 @st.cache_data(ttl=600)
+
 def get_real_data():
     response = supabase.table("hyrox_results").select("*").execute()
     if not response.data:
-        return pd.DataFrame(columns=['Athlete', 'Station', 'Time (min)', 'Date', 'Duration', 'RPE', 'Session_Load'])
+        # Added the new column to the empty state fallback
+        return pd.DataFrame(columns=['Athlete', 'Station', 'Time (min)', 'Fraction_Completed', 'Date', 'Duration', 'RPE', 'Session_Load'])
     
     df = pd.DataFrame(response.data)
+    
+    # Idiot-proofing: If the column is missing or null, assume they somehow finished it.
+    if 'fraction_completed' not in df.columns:
+        df['fraction_completed'] = 1.0
+    else:
+        df['fraction_completed'] = df['fraction_completed'].fillna(1.0)
+        
     df = df.rename(columns={
         'athlete_name': 'Athlete', 'station': 'Station', 'time_minutes': 'Time (min)', 
+        'fraction_completed': 'Fraction_Completed',
         'recorded_at': 'Date', 'duration_minutes': 'Duration', 'rpe': 'RPE'
     })
     df['Date'] = pd.to_datetime(df['Date'])
@@ -71,16 +82,24 @@ def bayesian_race_predictor(observed_projections: list, prior_mean: float = 90.0
         
     return pd.DataFrame(predictions)
 
-def station_to_race_pace(station: str, time_min: float) -> float:
-    # Heuristic to translate a single station time into a full 90-min race equivalent
+def station_to_race_pace(station: str, time_min: float, fraction_completed: float = 1.0) -> float:
+    # If they didn't even finish the station, extrapolate their time using Riegel's fatigue exponent.
+    # The exponent 1.06 accounts for the fact that humans slow down as distance increases.
+    # If fraction_completed is tiny, the math will correctly predict an abysmal time.
+    if fraction_completed <= 0.0:
+        return 999.0 # They did literally nothing. Give them a DNS.
+        
+    projected_station_time = time_min * ((1.0 / fraction_completed) ** 1.06)
+    
+    # Baselines for completing the FULL station
     baselines = {
         '1km Run': 4.5, 'SkiErg': 4.0, 'Sled Push': 3.0, 'Sled Pull': 4.0, 
         'Burpee Broad Jumps': 4.5, 'Rowing': 4.5, 'Farmers Carry': 2.0, 
         'Sandbag Lunges': 3.5, 'Wall Balls': 5.0, 'Full Race': 90.0
     }
     baseline = baselines.get(station, 4.0)
-    # If they are 10% slower than the baseline, their predicted race is 10% slower than 90 mins
-    return (time_min / baseline) * 90.0
+    
+    return (projected_station_time / baseline) * 90.0
 
 # UI
 st.title("Hyrox Analytics:")
@@ -139,7 +158,11 @@ else:
     # Bayesian Model, race prediction
     with col2:
         st.subheader("Projected Race Time (Bayesian)")
-        athlete_data['Projected_Pace'] = athlete_data.apply(lambda row: station_to_race_pace(row['Station'], row['Time (min)']), axis=1)
+        # Change this line wherever it appears in your code (col2 AND the Leaderboard loop):
+        athlete_data['Projected_Pace'] = athlete_data.apply(
+            lambda row: station_to_race_pace(row['Station'], row['Time (min)'], row['Fraction_Completed']), 
+            axis=1
+        )
         
         bayes_df = bayesian_race_predictor(athlete_data['Projected_Pace'].tolist())
         
@@ -164,25 +187,25 @@ else:
         else:
             st.info("Not enough data to run Bayesian prediction.")
 
-# Data entry
 st.sidebar.markdown("---")
 st.sidebar.subheader("Log New Session")
 
-# Get existing athletes for the dropdown
 existing_athletes = sorted(df['Athlete'].unique().tolist()) if not df.empty else []
-existing_athletes = ["+ Add New Athlete"] + existing_athletes
+existing_athletes = ["+ Add New Victim"] + existing_athletes
 
 with st.sidebar.form("data_entry_form", clear_on_submit=True):
-    # Selection logic
     athlete_choice = st.selectbox("Select Athlete", existing_athletes)
     
-    if athlete_choice == "+ Add New Athlete":
+    if athlete_choice == "+ Add New Victim":
         new_athlete_name = st.text_input("New Athlete Name").strip().title()
     else:
         new_athlete_name = athlete_choice
 
     new_station = st.selectbox("Focus Station", ['1km Run', 'SkiErg', 'Sled Push', 'Sled Pull', 'Burpee Broad Jumps', 'Rowing', 'Farmers Carry', 'Sandbag Lunges', 'Wall Balls', 'Full Race'])
-    new_time = st.number_input("Time on Station (mins)", min_value=0.0, value=5.0, step=0.1)
+    new_time = st.number_input("Time Survived (mins)", min_value=0.0, value=5.0, step=0.1)
+    
+    # NEW: Ask how much they actually did.
+    fraction_done = st.slider("Percentage of Station Completed", 1, 100, 100) / 100.0
     
     st.markdown("**Internal Load**")
     new_duration = st.number_input("Total Session Duration (mins)", min_value=1.0, value=60.0)
@@ -190,58 +213,30 @@ with st.sidebar.form("data_entry_form", clear_on_submit=True):
     new_date = st.date_input("Date", date.today())
     
     if st.form_submit_button("Submit Pain"):
-        if athlete_choice == "+ Add New Athlete" and not new_athlete_name:
-            st.error("Please enter a name for the new athlete.")
+        if athlete_choice == "+ Add New Victim" and not new_athlete_name:
+            st.error("Enter a name before I throw an exception.")
         else:
             try:
-
-                is_pb = False
-                recovery_status = "Incomplete Data"
+                # Calculate their pathetic projected pace behind the scenes
+                projected_race_pace = station_to_race_pace(new_station, float(new_time), fraction_done)
                 
-                if not df.empty:
-                    athlete_history = df[(df['Athlete'] == new_athlete_name) & (df['Station'] == new_station)]
-                    
-                    if not athlete_history.empty:
-                        previous_best = athlete_history['Time (min)'].min()
-                        if float(new_time) < previous_best:
-                            is_pb = True
-                        
-                        # Recovery Score: (Time * RPE) 
-                        # Lower score = Better efficiency (Lower time for lower effort)
-                        current_efficiency = float(new_time) * int(new_rpe)
-                        avg_efficiency = (athlete_history['Time (min)'] * athlete_history['RPE']).mean()
-                        
-                        if current_efficiency < (avg_efficiency * 0.95):
-                            recovery_status = "High Recovery (Highly Efficient)"
-                        elif current_efficiency > (avg_efficiency * 1.10):
-                            recovery_status = "High Fatigue (Low Efficiency)"
-                        else:
-                            recovery_status = "Normal / Baseline"
-
-
+                # Notice we store exactly what they did, but you can use fraction_done in your analytics later
                 supabase.table("hyrox_results").insert({
                     "athlete_name": new_athlete_name, 
                     "station": new_station,
                     "time_minutes": float(new_time), 
+                    "fraction_completed": float(fraction_done), # The permanent record of their frailty
                     "recorded_at": str(new_date),
                     "duration_minutes": float(new_duration), 
                     "rpe": int(new_rpe)
                 }).execute()
 
-                if is_pb:
-                    st.balloons()
-                    st.success(f"NEW PB! {new_athlete_name} crushed the {new_station}!")
-                else:
-                    st.success(f"Logged {new_athlete_name} successfully.")
-                
-                st.info(f"Recovery Check: {recovery_status}")
-
-                # 4. REFRESH
+                st.success(f"Logged {new_athlete_name}. Projected Race Pace based on this tragedy: {round(projected_race_pace, 1)} minutes.")
                 st.cache_data.clear()
                 st.rerun()
 
             except Exception as e:
-                st.error(f"Database error: {e}")
+                st.error(f"Database error. Probably your fault: {e}")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Data Hoarding")
@@ -334,15 +329,17 @@ if not df.empty:
             a_df = recent_df[recent_df['Athlete'] == athlete]
             
             # Calculate metrics
-            avg_strain = a_df['Session_Load'].mean() # Simplified strain for the month
+            avg_strain = a_df['Session_Load'].mean()
             total_minutes = a_df['Duration'].sum()
             sessions = len(a_df)
+            avg_completion = a_df['Fraction_Completed'].mean() * 100 # Turn it into a recognizable percentage
             
             summary_data.append({
                 "Athlete": athlete,
                 "Sessions": sessions,
                 "Total Mat Time (min)": total_minutes,
-                "Avg Session Intensity": round(avg_strain, 1)
+                "Avg Session Intensity": round(avg_strain, 1),
+                "Avg Completion %": f"{round(avg_completion, 1)}%" # The reality check
             })
         
         audit_df = pd.DataFrame(summary_data).sort_values("Avg Session Intensity", ascending=False)
@@ -351,6 +348,58 @@ if not df.empty:
         st.info("No data recorded in the last 30 days.")
 else:
     st.info("Database is empty.")
+
+st.markdown("---")
+st.header("Wall of Shame 📉")
+
+if not df.empty:
+    # Calculate all-time average completion percentage
+    shame_df = df.groupby('Athlete')['Fraction_Completed'].mean().reset_index()
+    shame_df['Average Completion (%)'] = (shame_df['Fraction_Completed'] * 100).round(1)
+    
+    # Filter out anyone who manages to complete at least half of their prescribed workout
+    quitters = shame_df[shame_df['Fraction_Completed'] < 0.5].sort_values('Fraction_Completed')
+    
+    if not quitters.empty:
+        st.error("Statistical liabilities. These individuals are averaging less than 50% completion across all sessions:")
+        
+        # Strip out the decimal fraction for the UI, keep it clean
+        display_shame = quitters[['Athlete', 'Average Completion (%)']]
+        
+        # Paint their failure dark red
+        st.dataframe(
+            display_shame.style.applymap(
+                lambda _: 'background-color: #4b0000; color: #ffcccc', 
+                subset=['Average Completion (%)']
+            ), 
+            use_container_width=True, 
+            hide_index=True
+        )
+    else:
+        st.success("Miraculously, no one is currently averaging below 50% completion. Give it time.")
+else:
+    st.info("Gathering failure data...")
+
+st.markdown("### Direct Harassment")
+st.caption("Click to open WhatsApp and confront them with their own data.")
+
+for _, row in quitters.iterrows():
+    failing_athlete = row['Athlete']
+    pitiful_percentage = row['Average Completion (%)']
+    
+    # The undeniable truth
+    toxic_message = (
+        f"Hi {failing_athlete}. My analytics dashboard flagged your recent Hyrox sessions. "
+        f"You are currently completing exactly {pitiful_percentage}% of your prescribed workouts. "
+        f"Are you pacing yourself for a 10-year race, or just giving up? Do better."
+    )
+    
+    # URL encode the hostility so browsers don't choke on it
+    safe_message = urllib.parse.quote(toxic_message)
+    whatsapp_url = f"https://wa.me/?text={safe_message}"
+    
+    # Modern Streamlit link button. Don't use raw HTML hacks.
+    st.link_button(f"📲 Text {failing_athlete}", whatsapp_url, use_container_width=True)
 
 # Weekly monitor
 st.markdown("---")
@@ -400,3 +449,64 @@ if not df.empty:
             st.info("Gathering more baseline data...")
     else:
         st.info("No sessions logged in the last 7 days.")
+
+st.markdown("---")
+st.header("Weekly Autopsies 🪦")
+st.caption("Generate a brutal summary of their last 7 days. Give them the cold, hard math.")
+
+if not df.empty:
+    # Look back exactly one week
+    seven_days_ago = pd.to_datetime(date.today() - timedelta(days=7))
+    last_week_df = df[df['Date'] >= seven_days_ago]
+    
+    if not last_week_df.empty:
+        # Generate a report for every soul who bothered to show up
+        for athlete in sorted(last_week_df['Athlete'].unique()):
+            a_df = last_week_df[last_week_df['Athlete'] == athlete]
+            
+            sessions = len(a_df)
+            total_duration = a_df['Duration'].sum()
+            avg_completion = (a_df['Fraction_Completed'].mean() * 100).round(1)
+            avg_rpe = a_df['RPE'].mean().round(1)
+            
+            # The Oracle's statistical verdict
+            if avg_completion >= 90:
+                verdict = "Anomaly detected. They might actually survive the warmup."
+            elif avg_completion >= 50:
+                verdict = "Consistently mediocre. Continuing to take their money is morally acceptable."
+            else:
+                verdict = "A statistical tragedy. If they register for a race, they will perish."
+
+            with st.expander(f"View Report: {athlete} (Avg Completion: {avg_completion}%)"):
+                report_text = f"""### Athlete Autopsy: {athlete}
+**Dates:** {seven_days_ago.strftime('%Y-%m-%d')} to {date.today().strftime('%Y-%m-%d')}
+
+#### The Damage
+* **Sessions Attempted:** {sessions}
+* **Total Mat Time:** {total_duration} minutes
+* **Average Completion Rate:** {avg_completion}%
+* **Claimed Effort (RPE):** {avg_rpe}/10 
+
+#### Breakdown
+"""
+                # List their individual failures
+                for _, row in a_df.iterrows():
+                    station = row['Station']
+                    pct = round(row['Fraction_Completed'] * 100, 1)
+                    report_text += f"* {row['Date'].strftime('%A')}: {station} - {pct}% completed in {row['Time (min)']} mins.\n"
+                
+                report_text += f"\n**Oracle's Verdict:** {verdict}\n"
+                
+                st.markdown(report_text)
+                
+                # Let you download it so you can print it and staple it to their forehead
+                st.download_button(
+                    label=f"Download {athlete}'s Failure", 
+                    data=report_text, 
+                    file_name=f"{athlete.replace(' ', '_')}_weekly_report.txt",
+                    mime="text/plain"
+                )
+    else:
+        st.info("Nobody logged any sessions this week. Completely expected.")
+else:
+    st.info("Database empty. You have no clients.")
